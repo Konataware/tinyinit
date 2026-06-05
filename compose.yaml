@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  tinyinit:
+    build: .
+    container_name: tinyinit-debug
+    privileged: true
+    stdin_open: true
+    tty: true
+    command: ["./target/debug/tinyinit", "/bin/sh"]
