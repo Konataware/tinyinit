@@ -46,7 +46,7 @@ fn main() {
 
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child: _child_pid }) => {
-            // Parent - Wait for signals.
+            // Parent, wait for signals.
             loop {
                 pause();
                 if CHILD_EXITED.load(Ordering::Relaxed) {
