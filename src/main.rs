@@ -1,6 +1,7 @@
-use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal, sigprocmask, SigmaskHow};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::{fork, ForkResult, execvp, pause, setpgid, getpgrp, Pid};
+use nix::errno::Errno;
 use std::ffi::CString;
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,12 +14,7 @@ extern "C" fn handle_sigchld(_: i32) {
     loop {
         match waitpid(None, Some(WaitPidFlag::WNOHANG)){
             Ok(WaitStatus::Exited(_, _)) | Ok(WaitStatus::Signaled(_, _, _)) => {
-                /*
-                A child exited, could be a main one or a zombie. 
-                Ideally we check PID for this. For minimum viable simplicity, we just mark it as exited.
-                */
                 CHILD_EXITED.store(true, Ordering::Relaxed);
-                // Continues loop to kill any other children
             }
             Ok(WaitStatus::StillAlive) => break,
             Ok(_) => break,
@@ -44,9 +40,20 @@ fn main() {
         exit(1);
     }
 
+    // ignoring SIGTTOU so the parent doesn't get stopped when child calls tcsetpgrp
+    let ignore_action = SigAction::new(
+        SigHandler::SigIgn,
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    unsafe {
+        let _ = sigaction(Signal::SIGTTOU, &ignore_action);
+        let _ = sigaction(Signal::SIGTTIN, &ignore_action);
+    }
+
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child: _child_pid }) => {
-            // Parent, wait for signals.
+            // parent: wait for signals only, no terminal handling
             loop {
                 pause();
                 if CHILD_EXITED.load(Ordering::Relaxed) {
@@ -54,30 +61,47 @@ fn main() {
                 }
             }
         }
+        #[allow(unused_unsafe)]
         #[allow(unreachable_code)]
         Ok(ForkResult::Child) => {
-            // Puts child in its own process group
-            setpgid(Pid::from_raw(0), Pid::from_raw(0)).expect("setpgid");
-            
-            // Make it the foreground process group of the terminal
-            let stdin_fd = 0; // File descriptor 0 is stdin
+
+            unsafe { libc::setsid(); }
+            // places child into its own process group
+            setpgid(Pid::from_raw(0), Pid::from_raw(0)).expect("setpgid failed");
+
+            let stdin_fd = 0;
+            unsafe { libc::ioctl(stdin_fd, libc::TIOCSCTTY, 0); }
+
+            let mut new_sigset = SigSet::empty();
+            new_sigset.add(Signal::SIGTTOU);
+            let mut old_sigset = SigSet::empty();
+            unsafe {
+                sigprocmask(SigmaskHow::SIG_BLOCK, Some(&new_sigset), Some(&mut old_sigset))
+                    .expect("[ERROR] sigprocmask block failed!");
+            }
+
+            // make this process group the foreground of the controlling terminal
             let result = unsafe { libc::tcsetpgrp(stdin_fd, getpgrp().as_raw()) };
-            if result == 0 {
-                // Success, nothing to do
-            } else {
-                let errno = nix::errno::Errno::last_raw(); // returns i32
-                if errno == libc::ENOTTY {
-                    // NO TTY - WE CONTINUE
-                } else {
+            if result != 0 {
+                let errno = Errno::last_raw();
+                if errno != libc::ENOTTY {
                     eprintln!("[ERROR] tcsetpgrp failed: {}", errno);
                 }
             }
 
-            let shell = CString::new("/bin/sh").unwrap();
-            let args = &[shell.as_c_str()];
+            unsafe {
+                sigprocmask(SigmaskHow::SIG_SETMASK, Some(&old_sigset), None)
+                    .expect("[ERROR] sigprocmask restore failed");
+            }
+
+            // executes the shell
+            let shell = CString::new("/bin/bash").unwrap();
+            let dash_i = CString::new("-i").unwrap();
+            let args = &[shell.as_c_str(), dash_i.as_c_str()];
             execvp(&shell, args).expect("execvp failed");
-            
         }
-        Err(e) => { println!("[ERROR] Fork failed: {}", e) }
-    } 
+        Err(e) => {
+            eprintln!("[ERROR] Fork failed: {}", e);
+        }
+    }
 }
